@@ -36,11 +36,10 @@ pub(crate) struct Hugepage {
 
 // handle hugepage
 impl Hugepage {
-    pub(crate) fn new(
-        mount: &oci::Mount,
-        hugepage_limits_map: HashMap<PageSize, Limit>,
-        fs_options: Vec<String>,
-    ) -> Result<Self> {
+    pub(crate) fn new(mount: &oci::Mount, spec: &oci::Spec) -> Result<Self> {
+        let fs_options = get_huge_page_options(mount)?;
+        let hugepage_limits_map = get_huge_page_limits_map(spec)?;
+
         // Create mount option string
         let page_size = get_page_size(fs_options).context("failed to get page size")?;
         let option = hugepage_limits_map
@@ -73,6 +72,18 @@ impl Hugepage {
     }
 }
 
+pub(crate) fn is_huge_page(m: &oci::Mount) -> Result<bool> {
+    let file = File::open(PROC_MOUNTS_FILE).context("failed open file")?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let items: Vec<&str> = line.split(' ').collect();
+        if m.source == items[1] && items[2] == HUGETLBFS {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[async_trait]
 impl Volume for Hugepage {
     fn get_volume_mount(&self) -> Result<Vec<oci::Mount>> {
@@ -93,7 +104,7 @@ impl Volume for Hugepage {
     }
 }
 
-pub(crate) fn get_huge_page_option(m: &oci::Mount) -> Result<Option<Vec<String>>> {
+fn get_huge_page_options(m: &oci::Mount) -> Result<Option<Vec<String>>> {
     if m.source.is_empty() {
         return Err(anyhow!("empty mount source"));
     }
@@ -116,7 +127,7 @@ pub(crate) fn get_huge_page_option(m: &oci::Mount) -> Result<Option<Vec<String>>
 
 // TODO add hugepage limit to sandbox memory once memory hotplug is enabled
 // https://github.com/kata-containers/kata-containers/issues/5880
-pub(crate) fn get_huge_page_limits_map(spec: &oci::Spec) -> Result<HashMap<PageSize, Limit>> {
+fn get_huge_page_limits_map(spec: &oci::Spec) -> Result<HashMap<PageSize, Limit>> {
     let mut hugepage_limits_map: HashMap<PageSize, Limit> = HashMap::new();
     if let Some(l) = &spec.linux {
         if let Some(r) = &l.resources {
@@ -135,18 +146,21 @@ pub(crate) fn get_huge_page_limits_map(spec: &oci::Spec) -> Result<HashMap<PageS
     Ok(hugepage_limits_map)
 }
 
-fn get_page_size(fs_options: Vec<String>) -> Result<Byte> {
-    for fs_option in fs_options {
-        if fs_option.starts_with("pagesize=") {
-            let page_size = fs_option
-                .strip_prefix("pagesize=")
-                // the parameters passed are in unit M or G, append i to be Mi and Gi
-                .map(|s| format!("{}i", s))
-                .context("failed to strip prefix pagesize")?;
-            return Byte::from_str(page_size)
-                .map_err(|_| anyhow!("failed to convert string to byte"));
+fn get_page_size(fs_options: Option<Vec<String>>) -> Result<Byte> {
+    if let Some(fs_options) = fs_options {
+        for fs_option in fs_options {
+            if fs_option.starts_with("pagesize=") {
+                let page_size = fs_option
+                    .strip_prefix("pagesize=")
+                    // the parameters passed are in unit M or G, append i to be Mi and Gi
+                    .map(|s| format!("{}i", s))
+                    .context("failed to strip prefix pagesize")?;
+                return Byte::from_str(page_size)
+                    .map_err(|_| anyhow!("failed to convert string to byte"));
+            }
         }
     }
+
     Err(anyhow!("failed to get page size"))
 }
 
@@ -157,14 +171,14 @@ mod tests {
 
     use crate::volume::hugepage::{get_page_size, HUGETLBFS, NODEV};
 
-    use super::{get_huge_page_limits_map, get_huge_page_option};
+    use super::{get_huge_page_limits_map, get_huge_page_options};
     use byte_unit::Byte;
     use nix::mount::{mount, umount, MsFlags};
     use oci::{Linux, LinuxHugepageLimit, LinuxResources};
     use test_utils::skip_if_not_root;
 
     #[test]
-    fn test_get_huge_page_option() {
+    fn test_get_huge_page_limits_map() {
         let format_sizes = ["1GB", "2MB"];
         let mut huge_page_limits: Vec<LinuxHugepageLimit> = vec![];
         for format_size in format_sizes {
@@ -213,7 +227,7 @@ mod tests {
                 source: dst.to_str().unwrap().to_string(),
                 ..Default::default()
             };
-            let option = get_huge_page_option(&mount).unwrap().unwrap();
+            let option = get_huge_page_options(&mount).unwrap();
             let page_size = get_page_size(option).unwrap();
             assert_eq!(page_size, Byte::from_str(format_size).unwrap());
             umount(&dst).unwrap();

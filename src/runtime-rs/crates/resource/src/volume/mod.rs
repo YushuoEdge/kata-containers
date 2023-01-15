@@ -17,8 +17,6 @@ use tokio::sync::RwLock;
 
 use crate::share_fs::ShareFs;
 
-use self::hugepage::{get_huge_page_limits_map, get_huge_page_option};
-
 const BIND: &str = "bind";
 #[async_trait]
 pub trait Volume: Send + Sync {
@@ -64,15 +62,9 @@ impl VolumeResource {
                         .await
                         .with_context(|| format!("new share fs volume {:?}", m))?,
                 )
-            } else if let Some(options) =
-                get_huge_page_option(m).context("failed to check huge page")?
-            {
-                // get hugepage limits from oci
-                let hugepage_limits =
-                    get_huge_page_limits_map(spec).context("get huge page option")?;
-                // handle container hugepage
+            } else if hugepage::is_huge_page(m)? {
                 Arc::new(
-                    hugepage::Hugepage::new(m, hugepage_limits, options)
+                    hugepage::Hugepage::new(m, spec)
                         .with_context(|| format!("handle hugepages {:?}", m))?,
                 )
             } else if block_volume::is_block_volume(m) {
